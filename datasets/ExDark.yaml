@@ -1,21 +1,21 @@
 # Datasets----注意存放的绝对路径，相对路径不行，我试了一下
-train: /home/hm/github/Graduation_Project-/yolov7/datasets/ExDark/train
-val: /home/hm/github/Graduation_Project-/yolov7/datasets/ExDark/val
-test: /home/hm/github/Graduation_Project-/yolov7/datasets/ExDark/test
+train: /home/xieyang/github/Graduation_yolov7/datasets/ExDark/train
+val: /home/xieyang/github/Graduation_yolov7/datasets/ExDark/val
+test: /home/xieyang/github/Graduation_yolov7/datasets/ExDark/test
 
 nc: 12
 
 # Classes
 names:
-  0: Bicycle
-  1: Boat
-  2: Bottle
-  3: Bus
-  4: Car
-  5: Cat
-  6: Chair
-  7: Cup
-  8: Dog
-  9: Motorbike
-  10: People
-  11: Table
+  Bicycle: 0
+  Boat: 1
+  Bottle: 2
+  Bus: 3
+  Car: 4
+  Cat: 5
+  Chair: 6
+  Cup: 7
+  Dog: 8
+  Motorbike: 9
+  People: 10
+  Table: 11
