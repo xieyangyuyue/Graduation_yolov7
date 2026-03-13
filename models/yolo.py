@@ -6,7 +6,7 @@ from copy import deepcopy
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 import torch
-from models.common import *
+from models.common import * 
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging
@@ -774,7 +774,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                      RepResXCSPA, RepResXCSPB, RepResXCSPC,
                      GhostCSPA, GhostCSPB, GhostCSPC,
                      STCSPA, STCSPB, STCSPC,
-                     ST2CSPA, ST2CSPB, ST2CSPC]:
+                     ST2CSPA, ST2CSPB, ST2CSPC,CoordAtt]:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
