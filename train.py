@@ -68,6 +68,7 @@ def train(hyp, opt, device, tb_writer=None):
     loggers = {'wandb': None}  # loggers dict
     if rank in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
+        # [修复] 兼容 PyTorch 2.6 安全加载
         run_id = torch.load(weights, map_location=device, weights_only=False).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
         wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
         loggers['wandb'] = wandb_logger.wandb
@@ -84,7 +85,8 @@ def train(hyp, opt, device, tb_writer=None):
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        # [修复] 兼容 PyTorch 2.6 安全加载
+        ckpt = torch.load(weights, map_location=device, weights_only=False)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
@@ -194,7 +196,6 @@ def train(hyp, opt, device, tb_writer=None):
     else:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
@@ -202,21 +203,17 @@ def train(hyp, opt, device, tb_writer=None):
     # Resume
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
-        # Optimizer
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
 
-        # EMA
         if ema and ckpt.get('ema'):
             ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
             ema.updates = ckpt['updates']
 
-        # Results
         if ckpt.get('training_results') is not None:
             results_file.write_text(ckpt['training_results'])  # write results.txt
 
-        # Epochs
         start_epoch = ckpt['epoch'] + 1
         if opt.resume:
             assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
@@ -260,23 +257,18 @@ def train(hyp, opt, device, tb_writer=None):
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
             c = torch.tensor(labels[:, 0])  # classes
-            # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
-            # model._initialize_biases(cf.to(device))
             if plots:
-                #plot_labels(labels, names, save_dir, loggers)
                 if tb_writer:
                     tb_writer.add_histogram('classes', c, 0)
 
-            # Anchors
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
+    # [修复] DDP 死锁以及 unused parameters 问题
     if cuda and rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
-                    # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
-                    find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
+        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank, find_unused_parameters=True)
 
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
@@ -292,42 +284,39 @@ def train(hyp, opt, device, tb_writer=None):
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
-    # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossOTA(model)  # init loss class
     compute_loss = ComputeLoss(model)  # init loss class
+    
     # ------------------ 新增：早停机制初始化 ------------------
-    patience = 10 # 设置容忍度：连续 10个 epoch 指标没提升就停止训练
-    best_fitness_epoch = 0  # 用于记录产生最佳指标的 epoch 数
+    patience = 15  # 连续 15 个 epoch 指标没提升就停止训练
+    best_fitness_epoch = 0  
+    stop_training = False  
     # --------------------------------------------------------
+    
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
         # Update image weights (optional)
         if opt.image_weights:
-            # Generate indices
             if rank in [-1, 0]:
                 cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
                 iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
                 dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-            # Broadcast if DDP
             if rank != -1:
                 indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
                 dist.broadcast(indices, 0)
                 if rank != 0:
                     dataset.indices = indices.cpu().numpy()
-
-        # Update mosaic border
-        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(4, device=device)  # mean losses
         if rank != -1:
@@ -344,10 +333,8 @@ def train(hyp, opt, device, tb_writer=None):
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
-                # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
@@ -391,19 +378,14 @@ def train(hyp, opt, device, tb_writer=None):
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
                 pbar.set_description(s)
 
-                # Plot
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-                    # if tb_writer:
-                    #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
-                    #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})
 
             # end batch ------------------------------------------------------------------------------------------------
-        # end epoch ----------------------------------------------------------------------------------------------------
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
@@ -451,13 +433,13 @@ def train(hyp, opt, device, tb_writer=None):
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
+                best_fitness_epoch = epoch
             wandb_logger.end_epoch(best_result=best_fitness == fi)
-            # ------------------ 新增：早停判断逻辑 ------------------
+            
+            # ------------------ 早停判断：主进程标记 ------------------
             if (epoch - best_fitness_epoch) >= patience:
-                logger.info(f'\n[Early Stopping] 触发早停机制！')
-                logger.info(f'模型已经连续 {patience} 个 epoch 没有提升。')
-                logger.info(f'最佳模型产生在第 {best_fitness_epoch} 个 epoch，将停止训练以防止过拟合。')
-                break  # 立即跳出 epoch 大循环，结束训练
+                logger.info(f'\n[Early Stopping] 触发早停！连续 {patience} 轮无提升，最佳 epoch 为 {best_fitness_epoch}。')
+                stop_training = True
             # --------------------------------------------------------
 
             # Save model
@@ -471,7 +453,6 @@ def train(hyp, opt, device, tb_writer=None):
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
 
-                # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
@@ -485,11 +466,19 @@ def train(hyp, opt, device, tb_writer=None):
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
                 if wandb_logger.wandb:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
-                        wandb_logger.log_model(
-                            last.parent, opt, epoch, fi, best_model=best_fitness == fi)
+                        wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=best_fitness == fi)
                 del ckpt
 
-        # end epoch ----------------------------------------------------------------------------------------------------
+        # ------------------ 新增：多卡(DDP)安全的早停跳出逻辑 ------------------
+        # 将主进程的停止信号广播给所有 GPU，防止进程死锁崩溃！(缩进对齐严格校验)
+        stop_tensor = torch.tensor([1 if stop_training else 0], dtype=torch.int32, device=device)
+        if opt.world_size > 1:
+            dist.all_reduce(stop_tensor, op=dist.ReduceOp.SUM)
+        if stop_tensor.item() > 0:
+            break  # 所有 GPU 同步跳出 epoch 大循环，完美安全结束！
+        # -------------------------------------------------------------------
+        
+    # end epoch ----------------------------------------------------------------------------------------------------
     # end training
     if rank in [-1, 0]:
         # Plots
@@ -499,24 +488,27 @@ def train(hyp, opt, device, tb_writer=None):
                 files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
                 wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
                                               if (save_dir / f).exists()]})
-        # Test best.pt
+        
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
-        if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
-            for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                results, _, _ = test.test(opt.data,
-                                          batch_size=batch_size * 2,
-                                          imgsz=imgsz_test,
-                                          conf_thres=0.001,
-                                          iou_thres=0.7,
-                                          model=attempt_load(m, device).half(),
-                                          single_cls=opt.single_cls,
-                                          dataloader=testloader,
-                                          save_dir=save_dir,
-                                          save_json=True,
-                                          plots=False,
-                                          is_coco=is_coco,
-                                          v5_metric=opt.v5_metric)
-
+        
+        # ------------------ 强制生成最佳权重的所有评估图表 ------------------
+        if best.exists():
+            logger.info(f'\n[Final Evaluation] 正在测试最佳权重 {best} 并生成 F1/PR 曲线图表...')
+            test.test(data_dict,
+                      batch_size=batch_size * 2,
+                      imgsz=imgsz_test,
+                      conf_thres=0.001,
+                      iou_thres=0.65,
+                      model=attempt_load(best, device).half(),
+                      single_cls=opt.single_cls,
+                      dataloader=testloader,
+                      save_dir=save_dir,
+                      save_json=False,
+                      plots=True,  # 关键点：强制开启图表绘制！
+                      is_coco=is_coco,
+                      v5_metric=opt.v5_metric)
+        # ----------------------------------------------------------------------
+        
         # Strip optimizers
         final = best if best.exists() else last  # final model
         for f in last, best:
@@ -537,7 +529,7 @@ def train(hyp, opt, device, tb_writer=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolo7.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='yolov7.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
@@ -579,9 +571,6 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
-    #if opt.global_rank in [-1, 0]:
-    #    check_git_status()
-    #    check_requirements()
 
     # Resume
     wandb_run = check_wandb_resume(opt)
@@ -594,7 +583,6 @@ if __name__ == '__main__':
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
-        # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
         opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
@@ -604,6 +592,11 @@ if __name__ == '__main__':
     # DDP mode
     opt.total_batch_size = opt.batch_size
     device = select_device(opt.device, batch_size=opt.batch_size)
+    
+    # [修复] 优先读取环境变量里的 LOCAL_RANK 以兼容 torchrun
+    if 'LOCAL_RANK' in os.environ:
+        opt.local_rank = int(os.environ['LOCAL_RANK'])
+        
     if opt.local_rank != -1:
         assert torch.cuda.device_count() > opt.local_rank
         torch.cuda.set_device(opt.local_rank)
@@ -628,89 +621,50 @@ if __name__ == '__main__':
 
     # Evolve hyperparameters (optional)
     else:
-        # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
-        meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
-                'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
-                'momentum': (0.3, 0.6, 0.98),  # SGD momentum/Adam beta1
-                'weight_decay': (1, 0.0, 0.001),  # optimizer weight decay
-                'warmup_epochs': (1, 0.0, 5.0),  # warmup epochs (fractions ok)
-                'warmup_momentum': (1, 0.0, 0.95),  # warmup initial momentum
-                'warmup_bias_lr': (1, 0.0, 0.2),  # warmup initial bias lr
-                'box': (1, 0.02, 0.2),  # box loss gain
-                'cls': (1, 0.2, 4.0),  # cls loss gain
-                'cls_pw': (1, 0.5, 2.0),  # cls BCELoss positive_weight
-                'obj': (1, 0.2, 4.0),  # obj loss gain (scale with pixels)
-                'obj_pw': (1, 0.5, 2.0),  # obj BCELoss positive_weight
-                'iou_t': (0, 0.1, 0.7),  # IoU training threshold
-                'anchor_t': (1, 2.0, 8.0),  # anchor-multiple threshold
-                'anchors': (2, 2.0, 10.0),  # anchors per output grid (0 to ignore)
-                'fl_gamma': (0, 0.0, 2.0),  # focal loss gamma (efficientDet default gamma=1.5)
-                'hsv_h': (1, 0.0, 0.1),  # image HSV-Hue augmentation (fraction)
-                'hsv_s': (1, 0.0, 0.9),  # image HSV-Saturation augmentation (fraction)
-                'hsv_v': (1, 0.0, 0.9),  # image HSV-Value augmentation (fraction)
-                'degrees': (1, 0.0, 45.0),  # image rotation (+/- deg)
-                'translate': (1, 0.0, 0.9),  # image translation (+/- fraction)
-                'scale': (1, 0.0, 0.9),  # image scale (+/- gain)
-                'shear': (1, 0.0, 10.0),  # image shear (+/- deg)
-                'perspective': (0, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
-                'flipud': (1, 0.0, 1.0),  # image flip up-down (probability)
-                'fliplr': (0, 0.0, 1.0),  # image flip left-right (probability)
-                'mosaic': (1, 0.0, 1.0),  # image mixup (probability)
-                'mixup': (1, 0.0, 1.0),   # image mixup (probability)
-                'copy_paste': (1, 0.0, 1.0),  # segment copy-paste (probability)
-                'paste_in': (1, 0.0, 1.0)}    # segment copy-paste (probability)
+        meta = {'lr0': (1, 1e-5, 1e-1), 'lrf': (1, 0.01, 1.0), 'momentum': (0.3, 0.6, 0.98), 'weight_decay': (1, 0.0, 0.001), 'warmup_epochs': (1, 0.0, 5.0), 'warmup_momentum': (1, 0.0, 0.95), 'warmup_bias_lr': (1, 0.0, 0.2), 'box': (1, 0.02, 0.2), 'cls': (1, 0.2, 4.0), 'cls_pw': (1, 0.5, 2.0), 'obj': (1, 0.2, 4.0), 'obj_pw': (1, 0.5, 2.0), 'iou_t': (0, 0.1, 0.7), 'anchor_t': (1, 2.0, 8.0), 'anchors': (2, 2.0, 10.0), 'fl_gamma': (0, 0.0, 2.0), 'hsv_h': (1, 0.0, 0.1), 'hsv_s': (1, 0.0, 0.9), 'hsv_v': (1, 0.0, 0.9), 'degrees': (1, 0.0, 45.0), 'translate': (1, 0.0, 0.9), 'scale': (1, 0.0, 0.9), 'shear': (1, 0.0, 10.0), 'perspective': (0, 0.0, 0.001), 'flipud': (1, 0.0, 1.0), 'fliplr': (0, 0.0, 1.0), 'mosaic': (1, 0.0, 1.0), 'mixup': (1, 0.0, 1.0), 'copy_paste': (1, 0.0, 1.0), 'paste_in': (1, 0.0, 1.0)}
         
         with open(opt.hyp, errors='ignore') as f:
-            hyp = yaml.safe_load(f)  # load hyps dict
-            if 'anchors' not in hyp:  # anchors commented in hyp.yaml
+            hyp = yaml.safe_load(f)  
+            if 'anchors' not in hyp:  
                 hyp['anchors'] = 3
                 
         assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
-        opt.notest, opt.nosave = True, True  # only test/save final epoch
-        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
-        yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml'  # save best result here
+        opt.notest, opt.nosave = True, True  
+        yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml' 
         if opt.bucket:
-            os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
+            os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  
 
-        for _ in range(300):  # generations to evolve
-            if Path('evolve.txt').exists():  # if evolve.txt exists: select best hyps and mutate
-                # Select parent(s)
-                parent = 'single'  # parent selection method: 'single' or 'weighted'
+        for _ in range(300):  
+            if Path('evolve.txt').exists():  
+                parent = 'single'  
                 x = np.loadtxt('evolve.txt', ndmin=2)
-                n = min(5, len(x))  # number of previous results to consider
-                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min()  # weights
+                n = min(5, len(x)) 
+                x = x[np.argsort(-fitness(x))][:n]  
+                w = fitness(x) - fitness(x).min()  
                 if parent == 'single' or len(x) == 1:
-                    # x = x[random.randint(0, n - 1)]  # random selection
-                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
+                    x = x[random.choices(range(n), weights=w)[0]] 
                 elif parent == 'weighted':
-                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
+                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  
 
-                # Mutate
-                mp, s = 0.8, 0.2  # mutation probability, sigma
+                mp, s = 0.8, 0.2  
                 npr = np.random
                 npr.seed(int(time.time()))
-                g = np.array([x[0] for x in meta.values()])  # gains 0-1
+                g = np.array([x[0] for x in meta.values()])  
                 ng = len(meta)
                 v = np.ones(ng)
-                while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                while all(v == 1):  
                     v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
-                for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
-                    hyp[k] = float(x[i + 7] * v[i])  # mutate
+                for i, k in enumerate(hyp.keys()):  
+                    hyp[k] = float(x[i + 7] * v[i])  
 
-            # Constrain to limits
             for k, v in meta.items():
-                hyp[k] = max(hyp[k], v[1])  # lower limit
-                hyp[k] = min(hyp[k], v[2])  # upper limit
-                hyp[k] = round(hyp[k], 5)  # significant digits
+                hyp[k] = max(hyp[k], v[1])  
+                hyp[k] = min(hyp[k], v[2])  
+                hyp[k] = round(hyp[k], 5)  
 
-            # Train mutation
             results = train(hyp.copy(), opt, device)
-
-            # Write mutation results
             print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
 
-        # Plot results
         plot_evolution(yaml_file)
         print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
               f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
