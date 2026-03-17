@@ -299,6 +299,10 @@ def train(hyp, opt, device, tb_writer=None):
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossOTA(model)  # init loss class
     compute_loss = ComputeLoss(model)  # init loss class
+    # ------------------ 新增：早停机制初始化 ------------------
+    patience = 10 # 设置容忍度：连续 10个 epoch 指标没提升就停止训练
+    best_fitness_epoch = 0  # 用于记录产生最佳指标的 epoch 数
+    # --------------------------------------------------------
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
@@ -448,6 +452,13 @@ def train(hyp, opt, device, tb_writer=None):
             if fi > best_fitness:
                 best_fitness = fi
             wandb_logger.end_epoch(best_result=best_fitness == fi)
+            # ------------------ 新增：早停判断逻辑 ------------------
+            if (epoch - best_fitness_epoch) >= patience:
+                logger.info(f'\n[Early Stopping] 触发早停机制！')
+                logger.info(f'模型已经连续 {patience} 个 epoch 没有提升。')
+                logger.info(f'最佳模型产生在第 {best_fitness_epoch} 个 epoch，将停止训练以防止过拟合。')
+                break  # 立即跳出 epoch 大循环，结束训练
+            # --------------------------------------------------------
 
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
