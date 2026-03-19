@@ -54,7 +54,7 @@ def process_yolo_dataset(input_dir, output_dir, weights_path):
     DCE_net = enhance_net_nopool().to(device)
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"找不到权重文件 {weights_path}！请先执行 wget 下载。")
-    DCE_net.load_state_dict(torch.load(weights_path, map_location=device))
+    DCE_net.load_state_dict(torch.load(weights_path, map_location=device, weights_only=False))
     DCE_net.eval() # 开启评估模式
 
     splits = ['train', 'val', 'test']
