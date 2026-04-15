@@ -4,6 +4,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+# ========== 添加随机数种子 ==========
+# 设置随机种子确保结果可重现
+# 使用42作为种子（深度学习领域常用值）
+np.random.seed(42)
+# ==================================
+
 def cascade_iou(boxes, clusters):
     # 计算所有边界框与聚类中心的 IoU
     box_area = boxes[:, 0] * boxes[:, 1]
