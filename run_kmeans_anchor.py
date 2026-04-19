@@ -59,7 +59,7 @@ def kmeans_plus_plus(boxes, k=9, max_iter=100):
 
     return clusters, nearest_clusters
 
-def genetic_algorithm_evolution(boxes, clusters, epochs=1000, mutation_prob=0.9):
+def genetic_algorithm_evolution(boxes, clusters, epochs=100000, mutation_prob=0.9):
     print(f"🚀 启动遗传算法微调 ({epochs} 轮)...")
     best_clusters = clusters.copy()
     
@@ -112,7 +112,7 @@ if __name__ == '__main__':
 
     # 3. [修复点] 真正调用遗传算法进行微调！
     print("\n" + "="*40)
-    clusters = genetic_algorithm_evolution(boxes, clusters, epochs=1000)
+    clusters = genetic_algorithm_evolution(boxes, clusters, epochs=100000)
 
     # 4. 按面积排序并格式化输出
     area = clusters[:, 0] * clusters[:, 1]
