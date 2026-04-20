@@ -243,7 +243,7 @@ def train(hyp, opt, device, tb_writer=None):
     compute_loss = ComputeLoss(model)  
     
     # ------------------ 早停机制参数 ------------------
-    patience = 15
+    patience = 30   # 连续 30 个 epoch 指标没提升就停止训练
     best_fitness_epoch = 0  
     stop_training = False  
     # ------------------------------------------------
@@ -407,16 +407,9 @@ def train(hyp, opt, device, tb_writer=None):
     # end epoch 大循环 =========================================================================
 
     if rank in [-1, 0]:
-        if plots:
-            plot_results(save_dir=save_dir)  
-            if wandb_logger.wandb:
-                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
-                wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
-                                              if (save_dir / f).exists()]})
-        
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         
-        # ------------------ 强制生成最佳权重的所有评估图表 ------------------
+        # ------------------ 1. 先强制生成最佳权重的所有评估图表 ------------------
         if best.exists():
             logger.info(f'\n[Final Evaluation] 正在测试最佳权重 {best} 并生成 P/R/F1/PR 曲线等完整图表...')
             test.test(data_dict,
@@ -432,6 +425,15 @@ def train(hyp, opt, device, tb_writer=None):
                       plots=True,  # 强制生成所有需要的曲线图！
                       is_coco=is_coco,
                       v5_metric=opt.v5_metric)
+        # ----------------------------------------------------------------------
+        
+        # ------------------ 2. 再将刚刚生成的图表上传到 W&B ------------------
+        if plots:
+            plot_results(save_dir=save_dir)  
+            if wandb_logger.wandb:
+                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
+                wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
+                                              if (save_dir / f).exists()]})
         # ----------------------------------------------------------------------
         
         final = best if best.exists() else last  
@@ -493,6 +495,7 @@ if __name__ == '__main__':
 
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
+    opt.local_rank = int(os.environ.get('LOCAL_RANK', opt.local_rank))
     set_logging(opt.global_rank)
 
     wandb_run = check_wandb_resume(opt)
