@@ -4,6 +4,15 @@ from pathlib import Path
 
 import cv2
 import torch
+# ====================================================================
+# [全局安全补丁] 彻底解决 PyTorch 2.6 中 weights_only=True 导致的报错
+# ====================================================================
+_original_load = torch.load
+def _safe_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _safe_load
+# ====================================================================
 import torch.backends.cudnn as cudnn
 from numpy import random
 

@@ -6,6 +6,15 @@ from threading import Thread
 
 import numpy as np
 import torch
+# ====================================================================
+# [全局安全补丁] 彻底解决 PyTorch 2.6 中 weights_only=True 导致的报错
+# ====================================================================
+_original_load = torch.load
+def _safe_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _safe_load
+# ====================================================================
 import yaml
 from tqdm import tqdm
 
