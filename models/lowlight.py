@@ -118,3 +118,13 @@ class End2EndLowLightModel(nn.Module):
 
     def info(self, verbose=False, img_size=640):
         return self.yolo_net.info(verbose=verbose, img_size=img_size)
+
+
+def is_lowlight_model(model):
+    return hasattr(model, 'dce_net') and hasattr(model, 'yolo_net')
+
+
+def maybe_wrap_with_dce(model, dce_weights):
+    if not dce_weights or is_lowlight_model(model):
+        return model
+    return End2EndLowLightModel(model, dce_weights=dce_weights)

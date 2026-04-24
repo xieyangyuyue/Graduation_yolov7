@@ -19,13 +19,13 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
+from models.lowlight import is_lowlight_model, maybe_wrap_with_dce
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
-
 
 def test(data,
          weights=None,
@@ -65,11 +65,15 @@ def test(data,
 
         # Load model
         model = attempt_load(weights, map_location=device)  # load FP32 model
+        model = maybe_wrap_with_dce(model, getattr(opt, 'dce_weights', ''))
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
         if trace:
-            model = TracedModel(model, device, imgsz)
+            if is_lowlight_model(model):
+                print('TracedModel is not supported for Zero-DCE + YOLOv7, falling back to eager mode.')
+            else:
+                model = TracedModel(model, device, imgsz)
 
     # Half
     half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
@@ -318,6 +322,7 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--dce-weights', type=str, default='', help='wrap YOLO weights with Zero-DCE for validation')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file

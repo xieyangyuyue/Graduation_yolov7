@@ -17,12 +17,12 @@ import torch.backends.cudnn as cudnn
 from numpy import random
 
 from models.experimental import attempt_load
+from models.lowlight import is_lowlight_model, maybe_wrap_with_dce
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized, TracedModel
-
 
 def detect(save_img=False):
     source, weights, view_img, save_txt, imgsz, trace = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size, not opt.no_trace
@@ -41,11 +41,15 @@ def detect(save_img=False):
 
     # Load model
     model = attempt_load(weights, map_location=device)  # load FP32 model
+    model = maybe_wrap_with_dce(model, opt.dce_weights)
     stride = int(model.stride.max())  # model stride
     imgsz = check_img_size(imgsz, s=stride)  # check img_size
 
     if trace:
-        model = TracedModel(model, device, opt.img_size)
+        if is_lowlight_model(model):
+            print('TracedModel is not supported for Zero-DCE + YOLOv7, falling back to eager mode.')
+        else:
+            model = TracedModel(model, device, opt.img_size)
 
     if half:
         model.half()  # to FP16
@@ -192,6 +196,7 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
+    parser.add_argument('--dce-weights', type=str, default='', help='wrap YOLO weights with Zero-DCE for inference')
     opt = parser.parse_args()
     print(opt)
     #check_requirements(exclude=('pycocotools', 'thop'))
