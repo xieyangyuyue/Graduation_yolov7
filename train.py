@@ -36,7 +36,6 @@ from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
-from models.lowlight import End2EndLowLightModel
 from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
@@ -50,20 +49,6 @@ from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_di
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
-
-
-def remap_checkpoint_state_dict(ckpt_state_dict, model_state_dict, end2end=False):
-    remapped_state_dict = {}
-    for k, v in ckpt_state_dict.items():
-        key = k[7:] if k.startswith('module.') else k
-        if key in model_state_dict:
-            remapped_state_dict[key] = v
-            continue
-        if end2end:
-            yolo_key = f'yolo_net.{key}'
-            if yolo_key in model_state_dict:
-                remapped_state_dict[yolo_key] = v
-    return remapped_state_dict
 
 
 def train(hyp, opt, device, tb_writer=None):
@@ -103,34 +88,26 @@ def train(hyp, opt, device, tb_writer=None):
     names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  
 
-    use_zero_dce = opt.use_zero_dce
-    logger.info('Online Zero-DCE is %s', 'enabled' if use_zero_dce else 'disabled')
     pretrained = weights.endswith('.pt')
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  
         ckpt = torch.load(weights)  
-        base_yolo = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
-        model = End2EndLowLightModel(base_yolo, dce_weights=opt.dce_weights).to(device) if use_zero_dce else base_yolo
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  
         state_dict = ckpt['model'].float().state_dict()  
-        state_dict = remap_checkpoint_state_dict(state_dict, model.state_dict(), end2end=use_zero_dce)
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  
         model.load_state_dict(state_dict, strict=False)  
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  
     else:
-        base_yolo = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
-        model = End2EndLowLightModel(base_yolo, dce_weights=opt.dce_weights).to(device) if use_zero_dce else base_yolo
+        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  
     
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  
     train_path = data_dict['train']
     test_path = data_dict['val']
 
-    if use_zero_dce:
-        freeze = [f'yolo_net.model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
-    else:
-        freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
+    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  
     for k, v in model.named_parameters():
         v.requires_grad = True  
         if any(x in k for x in freeze):
@@ -185,7 +162,7 @@ def train(hyp, opt, device, tb_writer=None):
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
     start_epoch, best_fitness = 0, 0.0
-    if pretrained and opt.resume:
+    if pretrained:
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
@@ -205,8 +182,6 @@ def train(hyp, opt, device, tb_writer=None):
                         (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  
 
-        del ckpt, state_dict
-    elif pretrained:
         del ckpt, state_dict
 
     gs = max(int(model.stride.max()), 32)  
@@ -268,7 +243,7 @@ def train(hyp, opt, device, tb_writer=None):
     compute_loss = ComputeLoss(model)  
     
     # ------------------ 早停机制参数 ------------------
-    patience = 30   # 连续 30 个 epoch 指标没提升就停止训练
+    patience = 15
     best_fitness_epoch = 0  
     stop_training = False  
     # ------------------------------------------------
@@ -432,9 +407,16 @@ def train(hyp, opt, device, tb_writer=None):
     # end epoch 大循环 =========================================================================
 
     if rank in [-1, 0]:
+        if plots:
+            plot_results(save_dir=save_dir)  
+            if wandb_logger.wandb:
+                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
+                wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
+                                              if (save_dir / f).exists()]})
+        
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         
-        # ------------------ 1. 先强制生成最佳权重的所有评估图表 ------------------
+        # ------------------ 强制生成最佳权重的所有评估图表 ------------------
         if best.exists():
             logger.info(f'\n[Final Evaluation] 正在测试最佳权重 {best} 并生成 P/R/F1/PR 曲线等完整图表...')
             test.test(data_dict,
@@ -450,15 +432,6 @@ def train(hyp, opt, device, tb_writer=None):
                       plots=True,  # 强制生成所有需要的曲线图！
                       is_coco=is_coco,
                       v5_metric=opt.v5_metric)
-        # ----------------------------------------------------------------------
-        
-        # ------------------ 2. 再将刚刚生成的图表上传到 W&B ------------------
-        if plots:
-            plot_results(save_dir=save_dir)  
-            if wandb_logger.wandb:
-                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
-                wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
-                                              if (save_dir / f).exists()]})
         # ----------------------------------------------------------------------
         
         final = best if best.exists() else last  
@@ -516,13 +489,10 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
-    parser.add_argument('--use-zero-dce', action='store_true', help='enable online Zero-DCE + YOLOv7 end-to-end training')
-    parser.add_argument('--dce-weights', type=str, default='Epoch99.pth', help='pretrained Zero-DCE weights path')
     opt = parser.parse_args()
 
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
-    opt.local_rank = int(os.environ.get('LOCAL_RANK', opt.local_rank))
     set_logging(opt.global_rank)
 
     wandb_run = check_wandb_resume(opt)
