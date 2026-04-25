@@ -75,6 +75,7 @@ def train(hyp, opt, device, tb_writer=None):
     wdir.mkdir(parents=True, exist_ok=True)  
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
+    best_epoch_file = wdir / 'best_epoch.txt'
     results_file = save_dir / 'results.txt'
 
     with open(save_dir / 'hyp.yaml', 'w') as f:
@@ -282,6 +283,21 @@ def train(hyp, opt, device, tb_writer=None):
     for epoch in range(start_epoch, epochs):  # epoch 大循环 ===================================
         model.train()
 
+        # 在收敛末期关闭拼图增强，让模型回到真实尺度目标上精修定位。
+        close_mosaic_epochs = max(0, min(opt.close_mosaic_epochs, epochs))
+        if close_mosaic_epochs and epoch == (epochs - close_mosaic_epochs):
+            logger.info(f'\n[Spatial Annealing] Entering final {close_mosaic_epochs} epochs, disabling Mosaic and MixUp.')
+            dataloader.dataset.mosaic = False
+            dataloader.dataset.mixup = False
+            dataset.mosaic = False
+            dataset.mixup = False
+            hyp['mosaic'] = 0.0
+            hyp['mixup'] = 0.0
+            if hasattr(dataloader.dataset, 'hyp') and dataloader.dataset.hyp is not None:
+                dataloader.dataset.hyp['mosaic'] = 0.0
+                dataloader.dataset.hyp['mixup'] = 0.0
+            logger.info('Model switched to real-scale fine-tuning stage for low-light objects.')
+
         if opt.image_weights:
             if rank in [-1, 0]:
                 cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  
@@ -394,10 +410,12 @@ def train(hyp, opt, device, tb_writer=None):
             # ------------------ 早停与最佳模型保存逻辑 ------------------
             # [毕设关键]：仅按 mAP@0.5 (results[2]) 保存 best.pt！
             fi = results[2]  
-            if fi > best_fitness:
+            is_best = fi > best_fitness
+            if is_best:
                 best_fitness = fi
                 best_fitness_epoch = epoch
-            wandb_logger.end_epoch(best_result=best_fitness == fi)
+                best_epoch_file.write_text(f'epoch={epoch}\nmap50={fi:.6f}\n')
+            wandb_logger.end_epoch(best_result=is_best)
             
             if (epoch - best_fitness_epoch) >= patience:
                 logger.info(f'\n[Early Stopping] 触发早停！连续 {patience} 轮无提升，最佳 epoch 为 {best_fitness_epoch}。')
@@ -415,11 +433,13 @@ def train(hyp, opt, device, tb_writer=None):
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
 
                 torch.save(ckpt, last)
-                if best_fitness == fi:
+                if is_best:
                     torch.save(ckpt, best)
+                    torch.save(ckpt, wdir / f'best_e{epoch:03d}.pt')
+                    logger.info(f'[Best Checkpoint] Saved best.pt at epoch {epoch} with mAP@0.5={fi:.6f}')
                 if wandb_logger.wandb:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
-                        wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=best_fitness == fi)
+                        wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=is_best)
                 del ckpt
 
         # 将主进程的停止信号广播给所有 GPU，防止进程死锁崩溃！
@@ -437,6 +457,8 @@ def train(hyp, opt, device, tb_writer=None):
         # ------------------ 1. 先强制生成最佳权重的所有评估图表 ------------------
         if best.exists():
             logger.info(f'\n[Final Evaluation] 正在测试最佳权重 {best} 并生成 P/R/F1/PR 曲线等完整图表...')
+            if best_epoch_file.exists():
+                logger.info(f'[Best Checkpoint] {best_epoch_file.read_text().strip()}')
             test.test(data_dict,
                       batch_size=batch_size * 2,
                       imgsz=imgsz_test,
@@ -518,6 +540,7 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--use-zero-dce', action='store_true', help='enable online Zero-DCE + YOLOv7 end-to-end training')
     parser.add_argument('--dce-weights', type=str, default='Epoch99.pth', help='pretrained Zero-DCE weights path')
+    parser.add_argument('--close-mosaic-epochs', type=int, default=15, help='disable Mosaic and MixUp in the final N epochs')
     opt = parser.parse_args()
 
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1

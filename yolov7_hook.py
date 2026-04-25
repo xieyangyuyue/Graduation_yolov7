@@ -1,92 +1,125 @@
-import torch
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+from pathlib import Path
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
 # ================= 0. 注入安全加载补丁 (防无限递归版) =================
 if not hasattr(torch, '_safe_load_patched'):
     _original_load = torch.load
+
     def _safe_load(*args, **kwargs):
         kwargs['weights_only'] = False
         return _original_load(*args, **kwargs)
+
     torch.load = _safe_load
     torch._safe_load_patched = True
     print("✅ PyTorch 补丁首次注入成功！")
 else:
     print("✅ 补丁已存在，无需重复注入。")
-# ===============================================================================
+# ===================================================================
 
 from models.experimental import attempt_load
 
-# ================= 1. 配置路径 =================
-# 填入你的最佳模型权重路径 (请确认这是基线模型，还是你加了CA的改进模型)
-weights_path = '/kaggle/input/models/xue0309/exdark/pytorch/default/1/best.pt'
-# 挑选一张极暗的测试集图片
-img_path = '/kaggle/working/Graduation_yolov7/datasets/ExDark/val/images/2015_02602.jpg'
-# ===============================================
 
+class MultiFeatureExtractor:
+    def __init__(self, model, layer_indices):
+        self.features = {}
+        self.hooks = []
+        self.layer_indices = layer_indices
+        for idx in layer_indices:
+            hook = model.model[idx].register_forward_hook(self._make_hook(idx))
+            self.hooks.append(hook)
+
+    def _make_hook(self, idx):
+        def hook_fn(module, inputs, output):
+            self.features[idx] = output.detach().clone()
+
+        return hook_fn
+
+    def close(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+
+def build_heatmap(feature_tensor):
+    fmap = feature_tensor[0].detach().cpu().numpy()
+    heatmap = np.mean(fmap, axis=0)
+    heatmap = np.maximum(heatmap, 0)
+    if np.max(heatmap) > 0:
+        heatmap /= np.max(heatmap)
+    return heatmap
+
+
+def overlay_heatmap(image_bgr, heatmap):
+    heatmap_resized = cv2.resize(heatmap, (image_bgr.shape[1], image_bgr.shape[0]))
+    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+    superimposed = heatmap_color * 0.5 + image_bgr * 0.5
+    return heatmap_resized, np.uint8(superimposed)
+
+
+# ================= 1. 配置路径 =================
+weights_path = '/kaggle/input/models/xue0309/exdark/pytorch/default/1/best.pt'
+img_path = '/kaggle/working/Graduation_yolov7/datasets/ExDark/val/images/2015_02602.jpg'
+output_dir = Path('/kaggle/working/hook_vis_outputs')
+layer_map = {
+    102: 'P3_small',
+    104: 'P4_medium',
+    106: 'P5_large',
+}
+# ==============================================
+
+output_dir.mkdir(parents=True, exist_ok=True)
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
 print("🔄 正在加载模型...")
 model = attempt_load(weights_path, map_location=device)
 model.eval()
 
-# 2. 注册 Hook 提取特征图 (Hook 机制)
-feature_maps = []
-def hook_fn(module, input, output):
-    # 将输出的 Tensor 截获并保存
-    feature_maps.append(output.detach().cpu().numpy())
+extractor = MultiFeatureExtractor(model, list(layer_map.keys()))
 
-# 挂载 Hook 到模型的第 104 层（通常是 Neck 融合输出，送入 Head 的前一层）
-# 如果报错说超出索引，或者画出来的图一片黑，可以尝试改成 101, 102, 或 105
-handle = model.model[104].register_forward_hook(hook_fn)
-
-# 3. 图像预处理
-print("🖼️ 正在处理图像并提取深层特征...")
+print("🖼️ 正在处理图像并提取多尺度特征...")
 img0 = cv2.imread(img_path)
 if img0 is None:
     raise FileNotFoundError(f"找不到图片：{img_path}")
+
 img_resized = cv2.resize(img0, (640, 640))
-img_tensor = img_resized[:, :, ::-1].transpose(2, 0, 1)  # BGR -> RGB -> CHW
+img_tensor = img_resized[:, :, ::-1].transpose(2, 0, 1)
 img_tensor = np.ascontiguousarray(img_tensor)
 img_tensor = torch.from_numpy(img_tensor).to(device).float() / 255.0
 img_tensor = img_tensor.unsqueeze(0)
 
-# 4. 前向推理 (触发 Hook)
 with torch.no_grad():
     _ = model(img_tensor)
 
-# 5. 生成热力图
-fmap = feature_maps[0][0]
-# 在通道维度上求平均，得到激活强度分布
-heatmap = np.mean(fmap, axis=0)
-heatmap = np.maximum(heatmap, 0) # ReLU 操作，过滤负值
-if np.max(heatmap) != 0:
-    heatmap /= np.max(heatmap)   # 归一化到 0~1
+for idx, layer_name in layer_map.items():
+    if idx not in extractor.features:
+        print(f"⚠️ 第 {idx} 层未捕获到特征图，跳过。")
+        continue
 
-# 6. 将热力图叠加到原图上
-heatmap_resized = cv2.resize(heatmap, (img0.shape[1], img0.shape[0]))
-heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-superimposed_img = heatmap_color * 0.5 + img0 * 0.5
+    heatmap = build_heatmap(extractor.features[idx])
+    heatmap_resized, superimposed_img = overlay_heatmap(img0, heatmap)
 
-# 7. 绘图展示
-fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-axes[0].imshow(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB))
-axes[0].set_title('Original Input', fontsize=14, fontweight='bold')
-axes[0].axis('off')
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    axes[0].imshow(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB))
+    axes[0].set_title('Original Input', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
 
-axes[1].imshow(heatmap, cmap='jet')
-axes[1].set_title('Deep Feature Activation', fontsize=14, fontweight='bold')
-axes[1].axis('off')
+    axes[1].imshow(heatmap_resized, cmap='jet')
+    axes[1].set_title(f'{layer_name} Activation', fontsize=14, fontweight='bold')
+    axes[1].axis('off')
 
-axes[2].imshow(cv2.cvtColor(np.uint8(superimposed_img), cv2.COLOR_BGR2RGB))
-axes[2].set_title('Superimposed Heatmap', fontsize=14, fontweight='bold')
-axes[2].axis('off')
+    axes[2].imshow(cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB))
+    axes[2].set_title(f'{layer_name} Overlay', fontsize=14, fontweight='bold')
+    axes[2].axis('off')
 
-output_path = '/kaggle/working/Feature_Map_Visualization.png'
-plt.savefig(output_path, dpi=300, bbox_inches='tight')
-print(f"✅ 特征热力图已生成并保存至：{output_path}")
-plt.show()
+    save_path = output_dir / f'{layer_name}_feature_map.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ {layer_name} 热力图已保存至：{save_path}")
 
-# 释放 Hook 内存
-handle.remove()
+extractor.close()
+print(f"✅ 全部 Hook 可视化完成，输出目录：{os.fspath(output_dir)}")
